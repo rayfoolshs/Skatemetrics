@@ -453,14 +453,16 @@ export default function App() {
           const resp = await fetch('/api/upload', { method: 'POST', body: form });
           if (!resp.ok) {
             let message = 'Upload failed';
+            let parsedJson = false;
             try {
               const data = await resp.json();
               message = data.error || message;
+              parsedJson = true;
             } catch {
               // Static host returned HTML instead of JSON.
             }
-            // 404/HTML means no Node API: fall back to local decoding.
-            if (resp.status === 404) {
+            // No Node API (404/405 or non-JSON response): decode locally instead.
+            if (!parsedJson || resp.status === 404 || resp.status === 405) {
               throw new TypeError('STATIC_HOST');
             }
             throw new Error(message);
