@@ -1,0 +1,6 @@
+{
+  "name": "Skate Metrics",
+  "description": "Markerless figure-skating jump analysis from YouTube links and rink video with 3D pose telemetry, flight height, rotation speed, and joint biomechanics.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
