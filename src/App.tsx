@@ -49,6 +49,53 @@ interface YouTubeMeta {
   botCheckNotice?: string;
 }
 
+const SESSION_STORAGE_KEY = 'skate-metrics:sessions:v1';
+
+const STATIC_HOST_MESSAGE =
+  'This public GitHub Pages build is fully client-side: YouTube fetching and server-side sessions are unavailable. Upload a clip or run the Synthetic Demo instead.';
+
+type StoredSessionMap = Record<string, SessionRecord>;
+
+function readLocalSessions(): SessionRecord[] {
+  try {
+    const raw = localStorage.getItem(SESSION_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw) as StoredSessionMap;
+    return Object.values(parsed).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  } catch {
+    return [];
+  }
+}
+
+function writeLocalSession(record: SessionRecord): void {
+  try {
+    const raw = localStorage.getItem(SESSION_STORAGE_KEY);
+    const map: StoredSessionMap = raw ? JSON.parse(raw) : {};
+    map[record.id] = record;
+    try {
+      localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(map));
+    } catch {
+      // Quota exceeded: persist a compact record without frame-heavy payloads.
+      map[record.id] = { ...record, poseFrames: undefined, keyframes: undefined };
+      localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(map));
+    }
+  } catch {
+    // Storage unavailable (private mode); analysis still works in memory.
+  }
+}
+
+function deleteLocalSession(id: string): void {
+  try {
+    const raw = localStorage.getItem(SESSION_STORAGE_KEY);
+    if (!raw) return;
+    const map = JSON.parse(raw) as StoredSessionMap;
+    delete map[id];
+    localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(map));
+  } catch {
+    // ignore
+  }
+}
+
 export default function App() {
   const [view, setView] = useState<NavView>('analyze');
   const [sourceMode, setSourceMode] = useState<SourceMode>('youtube');
@@ -82,6 +129,9 @@ export default function App() {
   // Saved Sessions List
   const [sessions, setSessions] = useState<SessionRecord[]>([]);
   const [sessionsLoading, setSessionsLoading] = useState(false);
+  // null = still checking; false = static/GitHub Pages build without the Node API
+  const [serverAvailable, setServerAvailable] = useState<boolean | null>(null);
+  const localVideoUrls = useRef<Map<string, string>>(new Map());
 
   const abortRef = useRef<AbortController | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -93,29 +143,46 @@ export default function App() {
       if (resp.ok) {
         const data = await resp.json();
         setSessions(Array.isArray(data) ? data : []);
+        return;
       }
     } catch {
-      // ignore transient list failure
+      // Static host: fall through to browser storage.
     } finally {
       setSessionsLoading(false);
     }
+    setSessions(readLocalSessions());
   }, []);
 
   useEffect(() => {
     fetchSessions();
+    let cancelled = false;
+    fetch('/api/health')
+      .then((resp) => resp.ok)
+      .catch(() => false)
+      .then((ok) => {
+        if (!cancelled) setServerAvailable(ok);
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [fetchSessions]);
 
   const saveSessionToServer = async (record: SessionRecord) => {
     try {
-      await fetch('/api/sessions', {
+      const resp = await fetch('/api/sessions', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(record),
       });
-      fetchSessions();
+      if (resp.ok) {
+        fetchSessions();
+        return;
+      }
     } catch {
-      // non-fatal persistence error
+      // Static host: persist in the browser instead.
     }
+    writeLocalSession(record);
+    fetchSessions();
   };
 
   const parsedYt = parseYouTubeLink(youtubeUrl);
@@ -134,6 +201,10 @@ export default function App() {
   };
 
   const handleProbeYouTube = async () => {
+    if (serverAvailable === false) {
+      setErrorMsg(STATIC_HOST_MESSAGE);
+      return;
+    }
     setErrorMsg(null);
     setYoutubeMeta(null);
     if (!youtubeUrl.trim()) {
@@ -211,6 +282,10 @@ export default function App() {
   };
 
   const handleLoadYouTubeOnly = async () => {
+    if (serverAvailable === false) {
+      setErrorMsg(STATIC_HOST_MESSAGE);
+      return;
+    }
     setErrorMsg(null);
     if (!youtubeUrl.trim()) {
       setErrorMsg('Paste a YouTube figure skating URL first.');
@@ -294,6 +369,10 @@ export default function App() {
   };
 
   const handleAnalyzeYouTube = async () => {
+    if (serverAvailable === false) {
+      setErrorMsg(STATIC_HOST_MESSAGE);
+      return;
+    }
     setErrorMsg(null);
     if (!youtubeUrl.trim() && !loadedVideo) {
       setErrorMsg('Paste a YouTube figure skating link to begin.');
@@ -314,29 +393,98 @@ export default function App() {
     }
   };
 
+  const loadLocalVideoFile = async (file: File): Promise<VideoDescriptor> => {
+    const objectUrl = URL.createObjectURL(file);
+    const probe = document.createElement('video');
+    probe.preload = 'metadata';
+    probe.muted = true;
+    probe.src = objectUrl;
+
+    try {
+      await new Promise<void>((resolve, reject) => {
+        probe.addEventListener('loadedmetadata', () => resolve(), { once: true });
+        probe.addEventListener('error', () => reject(new Error(
+          'This browser cannot decode that file locally. Try an MP4 (H.264) or WebM clip.',
+        )), { once: true });
+      });
+
+      const width = probe.videoWidth || 1280;
+      const height = probe.videoHeight || 720;
+      const duration = Number.isFinite(probe.duration) ? probe.duration : 0;
+      if (!duration) throw new Error('Could not read the clip duration.');
+
+      // Browsers do not expose source frame rate; assume 30 fps and let the
+      // pose sampler generate evenly spaced timestamps.
+      const fps = 30;
+      const videoId = `local-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+      localVideoUrls.current.set(videoId, objectUrl);
+
+      return {
+        videoId,
+        title: file.name,
+        sourceType: 'upload',
+        streamUrl: objectUrl,
+        width,
+        height,
+        fps,
+        duration,
+        frameCount: Math.round(duration * fps),
+        timestamps: [],
+      };
+    } finally {
+      probe.src = '';
+    }
+  };
+
   const handleUploadFile = async (file: File) => {
     setErrorMsg(null);
     setBusyPct(10);
     setBusyLabel(`Uploading ${file.name} and reading frame timestamps...`);
     try {
-      const form = new FormData();
-      form.append('video', file);
-      const resp = await fetch('/api/upload', { method: 'POST', body: form });
-      const data = await resp.json();
-      if (!resp.ok) throw new Error(data.error || 'Upload failed');
+      let desc: VideoDescriptor;
 
-      const desc: VideoDescriptor = {
-        videoId: data.videoId,
-        title: data.filename || file.name,
-        sourceType: 'upload',
-        streamUrl: data.streamUrl,
-        width: data.width,
-        height: data.height,
-        fps: data.fps,
-        duration: data.duration,
-        frameCount: data.frameCount,
-        timestamps: Array.isArray(data.timestamps) ? data.timestamps : [],
-      };
+      if (serverAvailable === false) {
+        setBusyLabel(`Preparing ${file.name} locally (client-side build)...`);
+        desc = await loadLocalVideoFile(file);
+      } else {
+        try {
+          const form = new FormData();
+          form.append('video', file);
+          const resp = await fetch('/api/upload', { method: 'POST', body: form });
+          if (!resp.ok) {
+            let message = 'Upload failed';
+            try {
+              const data = await resp.json();
+              message = data.error || message;
+            } catch {
+              // Static host returned HTML instead of JSON.
+            }
+            // 404/HTML means no Node API: fall back to local decoding.
+            if (resp.status === 404) {
+              throw new TypeError('STATIC_HOST');
+            }
+            throw new Error(message);
+          }
+          const data = await resp.json();
+
+          desc = {
+            videoId: data.videoId,
+            title: data.filename || file.name,
+            sourceType: 'upload',
+            streamUrl: data.streamUrl,
+            width: data.width,
+            height: data.height,
+            fps: data.fps,
+            duration: data.duration,
+            frameCount: data.frameCount,
+            timestamps: Array.isArray(data.timestamps) ? data.timestamps : [],
+          };
+        } catch (err) {
+          if (!(err instanceof TypeError)) throw err;
+          desc = await loadLocalVideoFile(file);
+        }
+      }
+
       setLoadedVideo(desc);
       setRoi(null);
       setCurrentTime(0);
@@ -446,53 +594,76 @@ export default function App() {
     await saveSessionToServer(updated);
   };
 
+  const openSessionRecord = (full: SessionRecord) => {
+    const localUrl = full.videoId ? localVideoUrls.current.get(full.videoId) : undefined;
+    setActiveSession(full);
+    setPoseFrames(full.poseFrames || []);
+    setKeyframes(full.keyframes || []);
+    setPlaybackSpeed(full.playbackSpeed || 1.0);
+    setSelectedJumpIdx(0);
+    setLoadedVideo({
+      videoId: full.videoId || full.id,
+      title: full.title,
+      sourceType: full.sourceType,
+      sourceUrl: full.sourceUrl || undefined,
+      streamUrl:
+        localUrl ||
+        (full.videoId && full.sourceType !== 'demo' && serverAvailable !== false
+          ? `/api/videos/${full.videoId}/stream`
+          : undefined),
+      width: full.width,
+      height: full.height,
+      fps: full.fps,
+      duration:
+        full.poseFrames && full.poseFrames.length > 0
+          ? full.poseFrames[full.poseFrames.length - 1].timestamp
+          : 2.4,
+      frameCount: full.poseFrames?.length || 0,
+      timestamps: full.poseFrames?.map((f) => f.timestamp) || [],
+    });
+    setCurrentTime(full.jumps?.[0]?.takeoffTime ?? 0);
+    setView('analyze');
+  };
+
   const handleOpenSavedSession = async (id: string) => {
     setErrorMsg(null);
     try {
       const resp = await fetch(`/api/sessions/${id}`);
-      if (!resp.ok) throw new Error('Could not load saved session');
+      if (!resp.ok) throw new Error('Server session unavailable');
       const full: SessionRecord = await resp.json();
-      setActiveSession(full);
-      setPoseFrames(full.poseFrames || []);
-      setKeyframes(full.keyframes || []);
-      setPlaybackSpeed(full.playbackSpeed || 1.0);
-      setSelectedJumpIdx(0);
-      setLoadedVideo({
-        videoId: full.videoId || full.id,
-        title: full.title,
-        sourceType: full.sourceType,
-        sourceUrl: full.sourceUrl || undefined,
-        streamUrl: full.videoId && full.sourceType !== 'demo' ? `/api/videos/${full.videoId}/stream` : undefined,
-        width: full.width,
-        height: full.height,
-        fps: full.fps,
-        duration:
-          full.poseFrames && full.poseFrames.length > 0
-            ? full.poseFrames[full.poseFrames.length - 1].timestamp
-            : 2.4,
-        frameCount: full.poseFrames?.length || 0,
-        timestamps: full.poseFrames?.map((f) => f.timestamp) || [],
-      });
-      setCurrentTime(full.jumps?.[0]?.takeoffTime ?? 0);
-      setView('analyze');
-    } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : 'Failed to open session');
+      openSessionRecord(full);
+    } catch {
+      const local = readLocalSessions().find((s) => s.id === id);
+      if (!local) {
+        setErrorMsg('Could not load that saved session.');
+        return;
+      }
+      openSessionRecord(local);
     }
   };
 
   const handleDeleteSavedSession = async (id: string) => {
     try {
       const resp = await fetch(`/api/sessions/${id}`, { method: 'DELETE' });
-      if (resp.ok) {
+      if (resp.ok || resp.status === 404) {
+        deleteLocalSession(id);
         setSessions((prev) => prev.filter((s) => s.id !== id));
         if (activeSession?.id === id) {
           setActiveSession(null);
           setPoseFrames([]);
           setKeyframes([]);
         }
+        return;
       }
     } catch {
-      // ignore
+      // Static host: delete from browser storage below.
+    }
+    deleteLocalSession(id);
+    setSessions((prev) => prev.filter((s) => s.id !== id));
+    if (activeSession?.id === id) {
+      setActiveSession(null);
+      setPoseFrames([]);
+      setKeyframes([]);
     }
   };
 
@@ -548,6 +719,14 @@ export default function App() {
       </header>
 
       <main className="flex-1 max-w-7xl w-full mx-auto px-6 py-7">
+        {serverAvailable === false && (
+          <div className="mb-5 border border-sky-200 bg-sky-50 text-sky-900 rounded-xl px-4 py-3 text-sm leading-relaxed">
+            <strong className="font-semibold">Static GitHub Pages build.</strong>{' '}
+            YouTube downloads and server-side session storage are unavailable here. Upload an
+            MP4/WebM clip or run the <strong>Synthetic Demo</strong>; analyses are saved in your
+            browser. MediaPipe pose models load from a public CDN.
+          </div>
+        )}
         {errorMsg && (
           <div className="mb-5 border border-rose-200 bg-rose-50 text-rose-900 rounded-xl px-4 py-3 flex items-start justify-between gap-3 text-sm">
             <div className="flex items-start gap-2.5">

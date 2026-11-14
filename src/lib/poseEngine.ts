@@ -8,6 +8,17 @@ import type {
   RoiBox,
 } from './types';
 
+// MediaPipe wasm + model assets are loaded from public CDNs so that the static
+// GitHub Pages build works without the Express server's /mediapipe and /api proxies.
+const MEDIAPIPE_WASM_URL =
+  'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.2.3/wasm';
+
+const MODEL_URLS: Record<'lite' | 'full' | 'heavy', string> = {
+  lite: 'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task',
+  full: 'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task',
+  heavy: 'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_heavy/float16/1/pose_landmarker_heavy.task',
+};
+
 // MediaPipe 33-landmark canonical names matching skate-metrics Python conventions
 const MP_LANDMARK_NAMES = [
   'nose',
@@ -55,10 +66,10 @@ async function getLandmarker(variant: 'lite' | 'full' | 'heavy'): Promise<PoseLa
     cachedLandmarker.instance.close();
     cachedLandmarker = null;
   }
-  const vision = await FilesetResolver.forVisionTasks('/mediapipe/wasm');
+  const vision = await FilesetResolver.forVisionTasks(MEDIAPIPE_WASM_URL);
   const instance = await PoseLandmarker.createFromOptions(vision, {
     baseOptions: {
-      modelAssetPath: `/api/mediapipe/model/${variant}`,
+      modelAssetPath: MODEL_URLS[variant],
       delegate: 'GPU',
     },
     runningMode: 'VIDEO',
